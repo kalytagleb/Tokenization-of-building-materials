@@ -2,30 +2,19 @@
 pragma solidity ^0.8.24;
 
 import {ERC3525} from "@solvprotocol/erc-3525/ERC3525.sol";
-import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
-import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
-
 import {IERC5192} from "../interfaces/IERC5192.sol";
-import {Roles} from "../access/Roles.sol";
+import {OrchestratorGuard} from "../access/OrchestratorGuard.sol";
 
-contract MaterialBatchToken is ERC3525, IERC5192 {
-    error NotOrchestrator(address caller);
+contract MaterialBatchToken is ERC3525, IERC5192, OrchestratorGuard {
     error TokenIsLocked(uint256 tokenId);
     error AlreadyLocked(uint256 tokenId);
 
-    IAccessControl public immutable actors;
     mapping(uint256 => bool) private _locked;
 
-    constructor(address actorRegistry) ERC3525("Material Batch", "MBT", 0) {
-        actors = IAccessControl(actorRegistry);
-    }
-
-    modifier onlyOrchestrator() {
-        if (!actors.hasRole(Roles.ORCHESTRATOR_ROLE, msg.sender)) {
-            revert NotOrchestrator(msg.sender);
-        }
-        _;
-    }
+    constructor(address actorRegistry)
+        ERC3525("Material Batch", "MBT", 0)
+        OrchestratorGuard(actorRegistry)
+    {}
 
     function mintBatch(address to, uint256 slot, uint256 value) 
         external 
@@ -93,7 +82,7 @@ contract MaterialBatchToken is ERC3525, IERC5192 {
         }
 
         bool isMovement = from_ != address(0) && to_ != address(0);
-        if (isMovement && !actors.hasRole(Roles.ORCHESTRATOR_ROLE, msg.sender)) {
+        if (isMovement && !_isOrchestrator(msg.sender)) {
             revert NotOrchestrator(msg.sender);
         }
 
