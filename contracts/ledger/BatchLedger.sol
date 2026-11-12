@@ -39,7 +39,7 @@ contract BatchLedger is OrchestratorGuard {
         address transporter;
         uint32 batchId;
         uint32 buildingId;
-        PieceStatus state;
+        PieceState state;
     }
 
     uint32 public lastRawMaterialId;
@@ -200,7 +200,7 @@ contract BatchLedger is OrchestratorGuard {
         uint96 amount,
         address actor
     ) external onlyOrchestrator {
-        if (transporter = address(0)) revert ZeroAddress();
+        if (transporter == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
 
         Batch storage batch = _requireBatchState(batchId, BatchState.Certified);
