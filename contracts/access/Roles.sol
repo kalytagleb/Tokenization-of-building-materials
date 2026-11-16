@@ -11,4 +11,5 @@ library Roles {
     bytes32 internal constant TRANSPORTER_ROLE = keccak256("TRANSPORTER_ROLE");
     bytes32 internal constant BUILDER_ROLE = keccak256("BUILDER_ROLE");
     bytes32 internal constant ORCHESTRATOR_ROLE = keccak256("ORCHESTRATOR_ROLE");
+    bytes32 internal constant EPD_VERTIFIER_ROLE = keccak256("EPD_VERIFIER_ROLE");
 }

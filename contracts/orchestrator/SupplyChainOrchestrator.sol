@@ -1,4 +1,4 @@
-// SPFX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
@@ -10,6 +10,7 @@ import {Roles} from "../access/Roles.sol";
 import {MaterialBatchToken} from "../tokens/MaterialBatchToken.sol";
 import {BatchLedger} from "../ledger/BatchLedger.sol";
 import {BuildingRegistry} from "../buildings/BuildingRegistry.sol";
+import {EnvironmentalRegistry} from "../environment/EnvironmentalRegistry.sol";
 
 contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
     using SafeCast for uint256;
@@ -24,17 +25,20 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
     error NotBuildingOwner(uint32 buildingId, address caller);
     error NotTokenOwner(uint256 tokenId, address caller);
     error TransporterWithoutRole(address transporter);
+    error VerifierIsManufacturer(address account);
 
     IAccessControl public immutable actors;
     MaterialBatchToken public immutable token;
     BatchLedger public immutable ledger;
     BuildingRegistry public immutable buildings;
+    EnvironmentalRegistry public immutable environment;
 
-    constructor(address actorRegistry, address tokenAddress, address ledgerAddress, address buildingAddress) {
+    constructor(address actorRegistry, address tokenAddress, address ledgerAddress, address buildingAddress, address environmentAddress) {
         actors = IAccessControl(actorRegistry);
         token = MaterialBatchToken(tokenAddress);
         ledger = BatchLedger(ledgerAddress);
         buildings = BuildingRegistry(buildingAddress);
+        environment = EnvironmentalRegistry(environmentAddress);
     }
 
     modifier onlyRole(bytes32 role) {
@@ -47,13 +51,17 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
         _;
     }
 
-    function pause() external {
+    function _requireAdmin() internal view {
         if (!actors.hasRole(0x00, msg.sender)) revert NotAdmin(msg.sender);
+    }
+
+    function pause() external {
+        _requireAdmin();
         _pause();
     }
 
     function unpause() external {
-        if (!actors.hasRole(0x00, msg.sender)) revert NotAdmin(msg.sender);
+        _requireAdmin();
         _unpause();
     }
 
@@ -69,7 +77,7 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
         return ledger.recordRawMaterial(msg.sender, documentHash);
     }
 
-    function proposeBatch(uint32 rawMaterialId, uint96 claimedAmmount, bytes32 documentHash)
+    function proposeBatch(uint32 rawMaterialId, uint96 claimedAmount, bytes32 documentHash)
         external safe nonReentrant onlyRole(Roles.MANUFACTURER_ROLE) returns (uint32)
     {
         return ledger.createBatch(msg.sender, rawMaterialId, claimedAmount, documentHash);
@@ -94,7 +102,7 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
     function revokeBatch(uint32 batchId, bytes32 reasonHash)
         external safe nonReentrant
     {
-        bool allowed = actors.hasRole(CERTIFIER_ROLE, msg.sender) || actors.hasRole(0x00, msg.sender);
+        bool allowed = actors.hasRole(Roles.CERTIFIER_ROLE, msg.sender) || actors.hasRole(0x00, msg.sender);
         if (!allowed) revert MissingRole(Roles.CERTIFIER_ROLE, msg.sender);
         ledger.revokeBatch(batchId, msg.sender, reasonHash);
     }
@@ -139,5 +147,37 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
 
         ledger.markInstalled(pieceId, msg.sender, evidenceHash);
         token.lockToken(pieceId);
+    }
+
+    function defineIndicator(string calldata name, bytes32 unit) 
+        external safe nonReentrant returns (bytes32)
+    {
+        _requireAdmin();
+        return environment.defineIndicator(name, unit);
+    }
+
+    function recordEnvironmentalData(
+        uint32 batchId,
+        bytes32[] calldata indicatorIds,
+        uint128[] calldata values,
+        uint48 validUntil,
+        bytes32 evidenceHash
+    ) external safe nonReentrant onlyRole(Roles.EPD_VERIFIER_ROLE) {
+        (address manufacturer,, BatchLedger.BatchState state,,,) = ledger.batches(batchId);
+
+        if (manufacturer == address(0)) revert BatchNotFound(batchId);
+        if (state != BatchLedger.BatchState.Certified) revert BatchNotCertified(batchId);
+        if (manufacturer == msg.sender) revert VerifierIsManufacturer(msg.sender);
+
+        environment.recordMeasurements(batchId, indicatorIds, values, validUntil, msg.sender, evidenceHash);
+    }
+
+    function revokeEnvironmentalData(uint32 batchId, bytes32 indicatorId, bytes32 reasonHash)
+        external safe nonReentrant
+    {
+        bool allowed = actors.hasRole(Roles.EPD_VERIFIER_ROLE, msg.sender) || actors.hasRole(0x00, msg.sender);
+        if (!allowed) revert MissingRole(Roles.EPD_VERIFIER_ROLE, msg.sender);
+
+        environment.revokeMeasurement(batchId, indicatorId, msg.sender, reasonHash);
     }
 }
