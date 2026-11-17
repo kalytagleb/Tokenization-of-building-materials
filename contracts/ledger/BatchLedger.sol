@@ -30,6 +30,8 @@ contract BatchLedger is OrchestratorGuard {
         address manufacturer;
         uint48 validUntil;
         BatchState state;
+        uint8 approvals;
+        uint8 rejections;
         uint96 claimedAmount;
         uint96 attestedAmount;
         uint64 mainTokenId;
@@ -44,9 +46,13 @@ contract BatchLedger is OrchestratorGuard {
 
     uint32 public lastRawMaterialId;
     uint32 public lastBatchId;
+    uint8 public immutable requiredVotes;
 
     mapping(uint32 => RawMaterial) public rawMaterials;
     mapping(uint32 => Batch) public batches;
+
+    // batchId => certifier => did he already vote?
+    mapping(uint32 => mapping(address => bool)) public hasVoted;
     mapping(uint256 => Piece) public pieces;
 
     event RawMaterialRecorded(uint32 indexed rawMaterialId, address indexed miner, bytes32 documentHash);
@@ -59,19 +65,18 @@ contract BatchLedger is OrchestratorGuard {
         bytes32 documentHash
     );
 
-    event BatchCertified(
+    event BatchVoted(
         uint32 indexed batchId,
         address indexed certifier,
+        bool approve,
         uint96 attestedAmount,
         uint48 validUntil,
         bytes32 reportHash
     );
 
-    event BatchRejected(
-        uint32 indexed batchId,
-        address indexed certifier,
-        bytes32 reportHash
-    );
+    event BatchCertified(uint32 indexed batchId, uint96 attestedAmount, uint48 validUntil);
+
+    event BatchRejected(uint32 indexed batchId);
 
     event BatchRevoked(
         uint32 indexed batchId,
@@ -118,8 +123,14 @@ contract BatchLedger is OrchestratorGuard {
     error ValidityInThePast(uint48 validUntil);
     error CertificateExpired(uint32 batchId, uint48 validUntil);
     error PieceAlreadyExists(uint256 pieceId);
+    error AlreadyVoted(uint32 batchId, address certifier);
+    error InvalidQuorum(uint8 requiredVotes);
+    error TokenAlreadyAttached(uint32 batchId);
 
-    constructor(address actorRegistry) OrchestratorGuard(actorRegistry) {}
+    constructor(address actorRegistry, uint8 requiredVotes_) OrchestratorGuard(actorRegistry) {
+        if (requiredVotes_ == 0) revert InvalidQuorum(requiredVotes_);
+        requiredVotes = requiredVotes_;
+    }
 
     function recordRawMaterial(address miner, bytes32 documentHash) 
         external
@@ -153,36 +164,62 @@ contract BatchLedger is OrchestratorGuard {
         emit BatchProposed(batchId, manufacturer, rawMaterialId, claimedAmount, documentHash);
     }
 
-    function approveBatch(
+    function voteApprove(
         uint32 batchId,
         address certifier,
         uint96 attestedAmount,
         uint48 validUntil,
-        uint64 mainTokenId,
         bytes32 reportHash
-    ) external onlyOrchestrator {
-        Batch storage batch = _requireBatchState(batchId, BatchState.Proposed);
-
-        if (certifier == batch.manufacturer) revert CertifierIsManufacturer(certifier);
+    ) external onlyOrchestrator returns (bool certified, uint96 finalAmount) {
+        Batch storage batch = _takeVote(batchId, certifier);
 
         if (attestedAmount == 0) revert ZeroAmount();
         if (attestedAmount > batch.claimedAmount) revert AmountAboveClaim(attestedAmount, batch.claimedAmount);
         if (validUntil <= block.timestamp) revert ValidityInThePast(validUntil);
 
-        batch.state = BatchState.Certified;
-        batch.attestedAmount = attestedAmount;
-        batch.validUntil = validUntil;
-        batch.mainTokenId = mainTokenId;
+        if (batch.approvals == 0) {
+            batch.attestedAmount = attestedAmount;
+            batch.validUntil = validUntil;
+        } else {
+            if (attestedAmount < batch.attestedAmount) batch.attestedAmount = attestedAmount;
+            if (validUntil < batch.validUntil) batch.validUntil = validUntil;
+        }
+        batch.approvals++;
 
-        emit BatchCertified(batchId, certifier, attestedAmount, validUntil, reportHash);
+        emit BatchVoted(batchId, certifier, true, attestedAmount, validUntil, reportHash);
+
+        if (batch.approvals >= requiredVotes) {
+            batch.state = BatchState.Certified;
+            emit BatchCertified(batchId, batch.attestedAmount, batch.validUntil);
+            return (true, batch.attestedAmount);
+        }
+        return (false, 0);
     }
 
-    function rejectBatch(uint32 batchId, address certifier, bytes32 reportHash) external onlyOrchestrator {
-        Batch storage batch = _requireBatchState(batchId, BatchState.Proposed);
-        if (certifier == batch.manufacturer) revert CertifierIsManufacturer(certifier);
+    function voteReject(uint32 batchId, address certifier, bytes32 reportHash)
+        external
+        onlyOrchestrator
+        returns (bool rejected)
+    {
+        Batch storage batch = _takeVote(batchId, certifier);
 
-        batch.state = BatchState.Rejected;
-        emit BatchRejected(batchId, certifier, reportHash);
+        batch.rejections++;
+
+        emit BatchVoted(batchId, certifier, false, 0, 0, reportHash);
+
+        if (batch.rejections >= requiredVotes) {
+            batch.state = BatchState.Rejected;
+            emit BatchRejected(batchId);
+            return true;
+        }
+        return false;
+    }
+
+    function attachToken(uint32 batchId, uint64 mainTokenId) external onlyOrchestrator {
+        Batch storage batch = _requireBatchState(batchId, BatchState.Certified);
+        if (batch.mainTokenId != 0) revert TokenAlreadyAttached(batchId);
+
+        batch.mainTokenId = mainTokenId;
     }
 
     function revokeBatch(uint32 batchId, address actor, bytes32 reasonHash) external onlyOrchestrator {
@@ -233,6 +270,15 @@ contract BatchLedger is OrchestratorGuard {
     function _requireBatchState(uint32 batchId, BatchState expected) internal view returns (Batch storage batch) {
         batch = batches[batchId];
         if (batch.state != expected) revert WrongBatchState(batchId, batch.state);
+    }
+
+    function _takeVote(uint32 batchId, address certifier) internal returns (Batch storage batch) {
+        batch = _requireBatchState(batchId, BatchState.Proposed);
+
+        if (certifier == batch.manufacturer) revert CertifierIsManufacturer(certifier);
+        if (hasVoted[batchId][certifier]) revert AlreadyVoted(batchId, certifier);
+
+        hasVoted[batchId][certifier] = true;
     }
 
     function _movePiece(uint256 pieceId, PieceState from, PieceState to) internal returns (Piece storage piece) {

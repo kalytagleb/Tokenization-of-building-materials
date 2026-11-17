@@ -86,17 +86,21 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
     function approveBatch(uint32 batchId, uint96 attestedAmount, uint48 validUntil, bytes32 reportHash)
         external safe nonReentrant onlyRole(Roles.CERTIFIER_ROLE)
     {
-        (address manufacturer,,,,,) = ledger.batches(batchId);
+        (address manufacturer,,,,,,,) = ledger.batches(batchId);
         if (manufacturer == address(0)) revert BatchNotFound(batchId);
 
-        uint256 tokenId = token.mintBatch(manufacturer, batchId, attestedAmount);
-        ledger.approveBatch(batchId, msg.sender, attestedAmount, validUntil, tokenId.toUint64(), reportHash);
+        (bool certified, uint96 finalAmount) = ledger.voteApprove(batchId, msg.sender, attestedAmount, validUntil, reportHash);
+
+        if (certified) {
+            uint256 tokenId = token.mintBatch(manufacturer, batchId, finalAmount);
+            ledger.attachToken(batchId, tokenId.toUint64());
+        }
     }
 
     function rejectBatch(uint32 batchId, bytes32 reportHash)
         external safe nonReentrant onlyRole(Roles.CERTIFIER_ROLE)
     {
-        ledger.rejectBatch(batchId, msg.sender, reportHash);
+        ledger.voteReject(batchId, msg.sender, reportHash);
     }
 
     function revokeBatch(uint32 batchId, bytes32 reasonHash)
@@ -110,7 +114,7 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
     function dispatchPiece(uint32 batchId, uint96 amount, address transporter, uint32 buildingId)
         external safe nonReentrant onlyRole(Roles.MANUFACTURER_ROLE) returns (uint256 pieceId)
     {
-        (address manufacturer,, BatchLedger.BatchState state,,, uint64 mainTokenId) = ledger.batches(batchId);
+        (address manufacturer,, BatchLedger.BatchState state,,,,, uint64 mainTokenId) = ledger.batches(batchId);
 
         if (manufacturer != msg.sender) revert NotBatchManufacturer(batchId, msg.sender);
         if (state != BatchLedger.BatchState.Certified) revert BatchNotCertified(batchId);
@@ -163,7 +167,7 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
         uint48 validUntil,
         bytes32 evidenceHash
     ) external safe nonReentrant onlyRole(Roles.EPD_VERIFIER_ROLE) {
-        (address manufacturer,, BatchLedger.BatchState state,,,) = ledger.batches(batchId);
+        (address manufacturer,, BatchLedger.BatchState state,,,,,) = ledger.batches(batchId);
 
         if (manufacturer == address(0)) revert BatchNotFound(batchId);
         if (state != BatchLedger.BatchState.Certified) revert BatchNotCertified(batchId);

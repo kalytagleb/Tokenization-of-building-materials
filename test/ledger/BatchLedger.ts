@@ -1,4 +1,5 @@
 import { expect } from "chai";
+import { id } from "ethers";
 import { network } from "hardhat";
 
 // Open a connection to the in-memory test blockchain that Hardhat provides.
@@ -14,6 +15,7 @@ const PieceState = { None: 0n, InTransit: 1n, Delivered: 2n, Accepted: 3n, Insta
 
 // A fake "document hash". In the real system this is the hash of a file in IPFS.
 const HASH = ethers.id("some document");
+const REQUIRED_VOTES = 2;
 
 describe("BatchLedger", function () {
   let admin: any;
@@ -21,6 +23,8 @@ describe("BatchLedger", function () {
   let miner: any;
   let manufacturer: any;
   let certifier: any;
+  let certifier2: any;
+  let certifier3: any;
   let transporter: any;
   let builder: any;
   let stranger: any;
@@ -35,13 +39,13 @@ describe("BatchLedger", function () {
   const PIECE = 2n; // the id of the token of the first piece
 
   beforeEach(async function () {
-    [admin, orchestrator, miner, manufacturer, certifier, transporter, builder, stranger] =
+    [admin, orchestrator, miner, manufacturer, certifier, transporter, builder, stranger, certifier2, certifier3] =
       await ethers.getSigners();
 
     registry = await ethers.deployContract("ActorRegistry", [admin.address]);
     await registry.grantRole(ORCHESTRATOR_ROLE, orchestrator.address);
 
-    ledger = await ethers.deployContract("BatchLedger", [await registry.getAddress()]);
+    ledger = await ethers.deployContract("BatchLedger", [await registry.getAddress(), REQUIRED_VOTES]);
   });
 
   // ---- Helpers: each one builds a situation we need in many tests ----------
@@ -71,7 +75,13 @@ describe("BatchLedger", function () {
     const validUntil = (await now()) + 1000;
     await ledger
       .connect(orchestrator)
-      .approveBatch(batchId, certifier.address, ATTESTED, validUntil, MAIN_TOKEN, HASH);
+      .voteApprove(batchId, certifier.address, ATTESTED, validUntil, HASH);
+    await ledger
+      .connect(orchestrator)
+      .voteApprove(batchId, certifier2.address, ATTESTED, validUntil, HASH);
+    await ledger
+      .connect(orchestrator)
+      .attachToken(batchId, MAIN_TOKEN);
     return batchId;
   }
 
@@ -142,105 +152,215 @@ describe("BatchLedger", function () {
   });
 
   // ---------------------------------------------------------------------------
-  describe("certification", function () {
-    it("certifies a batch and stores what the certifier confirmed", async function () {
-      const batchId = await proposedBatch();
-      const validUntil = (await now()) + 1000;
+  describe("certification (a vote of certifiers)", function () {
+    const approve = (id: number, who: any, amount: bigint, until: number) =>
+      ledger.connect(orchestrator).voteApprove(id, who.address, amount, until, HASH);
+    const reject = (id: number, who: any) =>
+      ledger.connect(orchestrator).voteReject(id, who.address, HASH);
 
-      await expect(
-        ledger
-          .connect(orchestrator)
-          .approveBatch(batchId, certifier.address, ATTESTED, validUntil, MAIN_TOKEN, HASH),
-      )
+    it("one vote is not enough: the batch stays Proposed", async function () {
+      const batchId = await proposedBatch();
+      const until = (await now()) + 1000;
+
+      await expect(approve(batchId, certifier, ATTESTED, until))
+        .to.emit(ledger, "BatchVoted")
+        .withArgs(batchId, certifier.address, true, ATTESTED, until, HASH);
+
+      const batch = await ledger.batches(batchId);
+      expect(batch.state).to.equal(BatchState.Proposed);
+      expect(batch.approvals).to.equal(1n);
+      expect(await ledger.hasVoted(batchId, certifier.address)).to.equal(true);
+    });
+
+    it("the second equal vote certifies the batch and ends the voting", async function () {
+      const batchId = await proposedBatch();
+      const until = (await now()) + 1000;
+      await approve(batchId, certifier, ATTESTED, until);
+
+      await expect(approve(batchId, certifier2, ATTESTED, until))
         .to.emit(ledger, "BatchCertified")
-        .withArgs(batchId, certifier.address, ATTESTED, validUntil, HASH);
+        .withArgs(batchId, ATTESTED, until);
 
       const batch = await ledger.batches(batchId);
       expect(batch.state).to.equal(BatchState.Certified);
       expect(batch.attestedAmount).to.equal(ATTESTED);
-      expect(batch.validUntil).to.equal(validUntil);
-      expect(batch.mainTokenId).to.equal(MAIN_TOKEN);
+      expect(batch.validUntil).to.equal(until);
+
+      // the third certifier is too late
+      await expect(approve(batchId, certifier3, ATTESTED, until)).to.be.revertedWithCustomError(
+        ledger,
+        "WrongBatchState",
+      );
     });
 
-    it("the certifier can not be the manufacturer of the batch", async function () {
+    it("takes the SMALLEST amount and the EARLIEST date that were named", async function () {
       const batchId = await proposedBatch();
-      const validUntil = (await now()) + 1000;
+      const now0 = await now();
 
-      await expect(
-        ledger
-          .connect(orchestrator)
-          .approveBatch(batchId, manufacturer.address, ATTESTED, validUntil, MAIN_TOKEN, HASH),
-      ).to.be.revertedWithCustomError(ledger, "CertifierIsManufacturer");
+      await approve(batchId, certifier, 90n, now0 + 5000);
+      await approve(batchId, certifier2, 70n, now0 + 3000);
 
-      await expect(
-        ledger.connect(orchestrator).rejectBatch(batchId, manufacturer.address, HASH),
-      ).to.be.revertedWithCustomError(ledger, "CertifierIsManufacturer");
+      const batch = await ledger.batches(batchId);
+      expect(batch.state).to.equal(BatchState.Certified);
+      expect(batch.attestedAmount).to.equal(70n);
+      expect(batch.validUntil).to.equal(now0 + 3000);
     });
 
-    it("can not confirm more than the manufacturer claimed", async function () {
+    it("the order of the votes does not matter: a LARGER second vote changes nothing", async function () {
       const batchId = await proposedBatch();
-      const validUntil = (await now()) + 1000;
+      const now0 = await now();
 
-      await expect(
-        ledger
-          .connect(orchestrator)
-          .approveBatch(batchId, certifier.address, CLAIMED + 1n, validUntil, MAIN_TOKEN, HASH),
-      ).to.be.revertedWithCustomError(ledger, "AmountAboveClaim");
+      // the first certifier is the most cautious, the second one is more generous
+      await approve(batchId, certifier, 70n, now0 + 3000);
+      await approve(batchId, certifier2, 90n, now0 + 5000);
+
+      const batch = await ledger.batches(batchId);
+      expect(batch.attestedAmount).to.equal(70n);
+      expect(batch.validUntil).to.equal(now0 + 3000);
     });
 
-    it("can not confirm a zero amount", async function () {
+    it("tells the orchestrator who won and with which amount", async function () {
       const batchId = await proposedBatch();
-      const validUntil = (await now()) + 1000;
+      const until = (await now()) + 1000;
 
-      await expect(
-        ledger.connect(orchestrator).approveBatch(batchId, certifier.address, 0, validUntil, MAIN_TOKEN, HASH),
-      ).to.be.revertedWithCustomError(ledger, "ZeroAmount");
+      const first = await ledger.connect(orchestrator).voteApprove.staticCall(batchId, certifier.address, 90n, until, HASH);
+      expect(first[0]).to.equal(false);
+
+      await approve(batchId, certifier, 90n, until);
+      const second = await ledger.connect(orchestrator).voteApprove.staticCall(batchId, certifier2.address, 80n, until, HASH);
+      expect(second[0]).to.equal(true);
+      expect(second[1]).to.equal(80n);
+    });
+
+    it("one certifier can not vote twice (not even with another opinion)", async function () {
+      const batchId = await proposedBatch();
+      const until = (await now()) + 1000;
+      await approve(batchId, certifier, ATTESTED, until);
+
+      await expect(approve(batchId, certifier, ATTESTED, until)).to.be.revertedWithCustomError(ledger, "AlreadyVoted");
+      await expect(reject(batchId, certifier)).to.be.revertedWithCustomError(ledger, "AlreadyVoted");
+    });
+
+    it("the manufacturer can not vote on his own batch", async function () {
+      const batchId = await proposedBatch();
+      const until = (await now()) + 1000;
+
+      await expect(approve(batchId, manufacturer, ATTESTED, until)).to.be.revertedWithCustomError(
+        ledger,
+        "CertifierIsManufacturer",
+      );
+      await expect(reject(batchId, manufacturer)).to.be.revertedWithCustomError(ledger, "CertifierIsManufacturer");
+    });
+
+    it("can not confirm more than the manufacturer claimed, or zero", async function () {
+      const batchId = await proposedBatch();
+      const until = (await now()) + 1000;
+
+      await expect(approve(batchId, certifier, CLAIMED + 1n, until)).to.be.revertedWithCustomError(
+        ledger,
+        "AmountAboveClaim",
+      );
+      await expect(approve(batchId, certifier, 0n, until)).to.be.revertedWithCustomError(ledger, "ZeroAmount");
     });
 
     it("needs a validity date in the future", async function () {
       const batchId = await proposedBatch();
-      const past = (await now()) - 10;
 
-      await expect(
-        ledger.connect(orchestrator).approveBatch(batchId, certifier.address, ATTESTED, past, MAIN_TOKEN, HASH),
-      ).to.be.revertedWithCustomError(ledger, "ValidityInThePast");
+      await expect(approve(batchId, certifier, ATTESTED, (await now()) - 10)).to.be.revertedWithCustomError(
+        ledger,
+        "ValidityInThePast",
+      );
     });
 
-    it("can not certify the same batch twice", async function () {
-      const batchId = await certifiedBatch();
-      const validUntil = (await now()) + 1000;
+    it("a refused vote leaves no trace (the certifier can vote again correctly)", async function () {
+      const batchId = await proposedBatch();
+      const until = (await now()) + 1000;
 
-      await expect(
-        ledger
-          .connect(orchestrator)
-          .approveBatch(batchId, certifier.address, ATTESTED, validUntil, MAIN_TOKEN, HASH),
-      ).to.be.revertedWithCustomError(ledger, "WrongBatchState");
+      await expect(approve(batchId, certifier, CLAIMED + 1n, until)).to.be.revertedWithCustomError(
+        ledger,
+        "AmountAboveClaim",
+      );
+      expect(await ledger.hasVoted(batchId, certifier.address)).to.equal(false);
+
+      await approve(batchId, certifier, ATTESTED, until); // now it works
     });
 
-    it("rejects a batch, and a rejected batch is final", async function () {
+    it("two votes 'no' reject the batch, and a rejected batch is final", async function () {
       const batchId = await proposedBatch();
 
-      await expect(ledger.connect(orchestrator).rejectBatch(batchId, certifier.address, HASH))
-        .to.emit(ledger, "BatchRejected")
-        .withArgs(batchId, certifier.address, HASH);
+      await expect(reject(batchId, certifier))
+        .to.emit(ledger, "BatchVoted")
+        .withArgs(batchId, certifier.address, false, 0, 0, HASH);
+      expect((await ledger.batches(batchId)).state).to.equal(BatchState.Proposed);
 
+      await expect(reject(batchId, certifier2)).to.emit(ledger, "BatchRejected").withArgs(batchId);
       expect((await ledger.batches(batchId)).state).to.equal(BatchState.Rejected);
 
-      // it can not be certified afterwards
-      const validUntil = (await now()) + 1000;
-      await expect(
-        ledger
-          .connect(orchestrator)
-          .approveBatch(batchId, certifier.address, ATTESTED, validUntil, MAIN_TOKEN, HASH),
-      ).to.be.revertedWithCustomError(ledger, "WrongBatchState");
+      const until = (await now()) + 1000;
+      await expect(approve(batchId, certifier3, ATTESTED, until)).to.be.revertedWithCustomError(
+        ledger,
+        "WrongBatchState",
+      );
     });
 
-    it("can not certify a batch that does not exist", async function () {
-      const validUntil = (await now()) + 1000;
+    it("when the votes are split, the THIRD certifier decides", async function () {
+      const until = (await now()) + 1000;
+
+      // case 1: yes, no, yes -> certified
+      let batchId = await proposedBatch();
+      await approve(batchId, certifier, ATTESTED, until);
+      await reject(batchId, certifier2);
+      expect((await ledger.batches(batchId)).state).to.equal(BatchState.Proposed);
+      await approve(batchId, certifier3, ATTESTED, until);
+      expect((await ledger.batches(batchId)).state).to.equal(BatchState.Certified);
+
+      // case 2: yes, no, no -> rejected (a second batch)
+      await ledger.connect(orchestrator).createBatch(manufacturer.address, 1, CLAIMED, HASH);
+      batchId = 2;
+      await approve(batchId, certifier, ATTESTED, until);
+      await reject(batchId, certifier2);
+      await reject(batchId, certifier3);
+      expect((await ledger.batches(batchId)).state).to.equal(BatchState.Rejected);
+    });
+
+    it("can not vote on a batch that does not exist", async function () {
+      const until = (await now()) + 1000;
+      await expect(approve(99, certifier, ATTESTED, until)).to.be.revertedWithCustomError(ledger, "WrongBatchState");
+    });
+
+    it("the token is attached once, and only to a certified batch", async function () {
+      const batchId = await proposedBatch();
+      await expect(
+        ledger.connect(orchestrator).attachToken(batchId, MAIN_TOKEN),
+      ).to.be.revertedWithCustomError(ledger, "WrongBatchState");
+
+      const until = (await now()) + 1000;
+      await approve(batchId, certifier, ATTESTED, until);
+      await approve(batchId, certifier2, ATTESTED, until);
+
+      await ledger.connect(orchestrator).attachToken(batchId, MAIN_TOKEN);
+      expect((await ledger.batches(batchId)).mainTokenId).to.equal(MAIN_TOKEN);
 
       await expect(
-        ledger.connect(orchestrator).approveBatch(99, certifier.address, ATTESTED, validUntil, MAIN_TOKEN, HASH),
-      ).to.be.revertedWithCustomError(ledger, "WrongBatchState");
+        ledger.connect(orchestrator).attachToken(batchId, 5n),
+      ).to.be.revertedWithCustomError(ledger, "TokenAlreadyAttached");
+    });
+
+    it("the number of required votes is set at deployment and can not be zero", async function () {
+      expect(await ledger.requiredVotes()).to.equal(REQUIRED_VOTES);
+
+      await expect(
+        ethers.deployContract("BatchLedger", [await registry.getAddress(), 0]),
+      ).to.be.revertedWithCustomError(ledger, "InvalidQuorum");
+    });
+
+    it("with a quorum of 1 one certifier is enough", async function () {
+      const single = await ethers.deployContract("BatchLedger", [await registry.getAddress(), 1]);
+      await single.connect(orchestrator).recordRawMaterial(miner.address, HASH);
+      await single.connect(orchestrator).createBatch(manufacturer.address, 1, CLAIMED, HASH);
+
+      await single.connect(orchestrator).voteApprove(1, certifier.address, ATTESTED, (await now()) + 1000, HASH);
+      expect((await single.batches(1)).state).to.equal(BatchState.Certified);
     });
   });
 
@@ -437,10 +557,11 @@ describe("BatchLedger", function () {
         ["recordRawMaterial", () => ledger.connect(stranger).recordRawMaterial(miner.address, HASH)],
         ["createBatch", () => ledger.connect(stranger).createBatch(manufacturer.address, 1, CLAIMED, HASH)],
         [
-          "approveBatch",
-          () => ledger.connect(stranger).approveBatch(1, certifier.address, ATTESTED, 9999999999, 1, HASH),
+          "voteApprove",
+          () => ledger.connect(stranger).voteApprove(1, certifier.address, ATTESTED, 9999999999, HASH),
         ],
-        ["rejectBatch", () => ledger.connect(stranger).rejectBatch(1, certifier.address, HASH)],
+        ["voteReject", () => ledger.connect(stranger).voteReject(1, certifier.address, HASH)],
+        ["attachToken", () => ledger.connect(stranger).attachToken(1, 1)],
         ["revokeBatch", () => ledger.connect(stranger).revokeBatch(1, certifier.address, HASH)],
         [
           "createPiece",

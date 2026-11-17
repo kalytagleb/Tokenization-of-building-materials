@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {OrchestratorGuard} from "../access/OrchestratorGuard.sol";
 
-contract EnvironmetalRegistry is OrchestratorGuard {
+contract EnvironmentalRegistry is OrchestratorGuard {
     struct Measurement {
         uint128 value;
         uint48 validUntil;
