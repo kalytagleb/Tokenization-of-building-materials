@@ -10,11 +10,21 @@ contract MaterialBatchToken is ERC3525, IERC5192, OrchestratorGuard {
     error AlreadyLocked(uint256 tokenId);
 
     mapping(uint256 => bool) private _locked;
+    string private _metadataBase;
 
-    constructor(address actorRegistry)
+    event BaseURIChanged(string newBaseURI);
+
+    constructor(address actorRegistry, string memory baseURI_)
         ERC3525("Material Batch", "MBT", 0)
         OrchestratorGuard(actorRegistry)
-    {}
+    {
+        _metadataBase = baseURI_;
+    }
+
+    function setBaseURI(string calldata newBaseURI) external onlyOrchestrator {
+        _metadataBase = newBaseURI;
+        emit BaseURIChanged(newBaseURI);
+    }
 
     function mintBatch(address to, uint256 slot, uint256 value) 
         external 
@@ -62,6 +72,10 @@ contract MaterialBatchToken is ERC3525, IERC5192, OrchestratorGuard {
     // ERC-165
     function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
         return interfaceId == type(IERC5192).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    function _baseURI() internal view override returns (string memory) {
+        return _metadataBase;
     }
 
     function _beforeValueTransfer(

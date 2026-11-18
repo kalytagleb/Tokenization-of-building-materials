@@ -31,7 +31,7 @@ describe("SupplyChainOrchestrator", function () {
 
     registry = await ethers.deployContract("ActorRegistry", [admin.address]);
     const r = await registry.getAddress();
-    token = await ethers.deployContract("MaterialBatchToken", [r]);
+    token = await ethers.deployContract("MaterialBatchToken", [r, "https://passport.example/"]);
     ledger = await ethers.deployContract("BatchLedger", [r, 2, WINDOW]); // 2 equal votes decide
     buildings = await ethers.deployContract("BuildingRegistry", [r]);
     environment = await ethers.deployContract("EnvironmentalRegistry", [r]);
@@ -460,6 +460,25 @@ describe("SupplyChainOrchestrator", function () {
       await expect(orch.connect(builder).disputeDelivery(PIECE, HASH)).to.be.revertedWith("Pausable: paused");
       await expect(orch.connect(admin).resolveDispute(PIECE, true, HASH)).to.be.revertedWith("Pausable: paused");
       await expect(orch.connect(manufacturer).acceptByTimeout(PIECE)).to.be.revertedWith("Pausable: paused");
+    });
+  });
+
+  describe("metadata addresses", function () {
+    it("the admin changes the base address of the tokens", async function () {
+      await certified();
+      expect(await token.tokenURI(1)).to.equal("https://passport.example/1");
+
+      await orch.connect(admin).setTokenBaseURI("https://new.example/");
+      expect(await token.tokenURI(1)).to.equal("https://new.example/1");
+    });
+
+    it("nobody else can, and not while the platform is paused", async function () {
+      await expect(
+        orch.connect(manufacturer).setTokenBaseURI("https://evil.example/"),
+      ).to.be.revertedWithCustomError(orch, "NotAdmin");
+
+      await orch.connect(admin).pause();
+      await expect(orch.connect(admin).setTokenBaseURI("https://x.example/")).to.be.revertedWith("Pausable: paused");
     });
   });
 

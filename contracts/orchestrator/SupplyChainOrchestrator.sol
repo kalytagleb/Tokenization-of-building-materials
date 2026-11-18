@@ -184,6 +184,11 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
         _moveToBuilder(pieceId, buildingId); 
     }
 
+    function setTokenBaseURI(string calldata newBaseURI) external safe nonReentrant {
+        _requireAdmin();
+        token.setBaseURI(newBaseURI);
+    }
+
     function defineIndicator(string calldata name, bytes32 unit) 
         external safe nonReentrant returns (bytes32)
     {

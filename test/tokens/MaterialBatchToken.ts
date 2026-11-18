@@ -8,6 +8,7 @@ const ORCHESTRATOR_ROLE = ethers.id("ORCHESTRATOR_ROLE");
 const TRANSFER_WHOLE_TOKEN = "transferFrom(address, address, uint256)";
 const TRANSFER_VALUE_TO_TOKEN = "transferFrom(uint256, uint256, uint256)";
 const TRANSFER_VALUE_TO_ADDRESS = "transferFrom(uint256, address, uint256)";
+const BASE_URI = "https://passport.example/";
 
 describe("MaterialBatchToken", function () {
     let admin: any;
@@ -28,7 +29,7 @@ describe("MaterialBatchToken", function () {
         registry = await ethers.deployContract("ActorRegistry", [admin.address]);
         await registry.grantRole(ORCHESTRATOR_ROLE, orchestrator.address);
 
-        token = await ethers.deployContract("MaterialBatchToken", [await registry.getAddress()]);
+        token = await ethers.deployContract("MaterialBatchToken", [await registry.getAddress(), BASE_URI]);
     });
 
     async function mintFirstBatch() {
@@ -112,6 +113,57 @@ describe("MaterialBatchToken", function () {
                   .connect(manufacturer)
                   [TRANSFER_WHOLE_TOKEN](manufacturer.address, builder.address, id),
             ).to.be.revertedWithCustomError(token, "NotOrchestrator");
+        });
+    });
+
+    describe("metadata addresses", function () {
+        it("tokenURI is the base address plus the token id", async function () {
+            const id = await mintFirstBatch();
+
+            expect(await token.tokenURI(id)).to.equal(BASE_URI + "1");
+        });
+
+        it("slotURI and contractURI are built from the same base address", async function () {
+            expect(await token.slotURI(SLOT)).to.equal(BASE_URI + "slot/" + SLOT.toString());
+            expect(await token.contractURI()).to.equal(
+                BASE_URI + "contract/" + (await token.getAddress()).toLowerCase(),
+            );
+        });
+
+        it("tokenURI of a token that does not exist is refused", async function () {
+            await expect(token.tokenURI(99)).to.be.revertedWith("ERC3525: invalid token ID");
+        });
+
+        it("the orchestrator can change the base address, a stranger can not", async function () {
+            const id = await mintFirstBatch();
+
+            await expect(token.connect(stranger).setBaseURI("https://evil.example/")).to.be.revertedWithCustomError(
+                token,
+                "NotOrchestrator",
+            );
+
+            await expect(token.connect(orchestrator).setBaseURI("https://new.example/"))
+                .to.emit(token, "BaseURIChanged")
+                .withArgs("https://new.example/");
+            expect(await token.tokenURI(id)).to.equal("https://new.example/1");
+        });
+
+        it("changing the address does not touch owner, value or lock", async function () {
+            const id = await mintFirstBatch();
+            await token.connect(orchestrator).lockToken(id);
+
+            await token.connect(orchestrator).setBaseURI("https://new.example/");
+
+            expect(await token.ownerOf(id)).to.equal(manufacturer.address);
+            expect(await token["balanceOf(uint256)"](id)).to.equal(TOTAL);
+            expect(await token.locked(id)).to.equal(true);
+        });
+
+        it("an empty base address gives empty metadata addresses", async function () {
+            const bare = await ethers.deployContract("MaterialBatchToken", [await registry.getAddress(), ""]);
+            await bare.connect(orchestrator).mintBatch(manufacturer.address, SLOT, TOTAL);
+
+            expect(await bare.tokenURI(1)).to.equal("");
         });
     });
 
