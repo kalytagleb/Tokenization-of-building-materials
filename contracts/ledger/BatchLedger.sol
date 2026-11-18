@@ -18,7 +18,9 @@ contract BatchLedger is OrchestratorGuard {
         InTransit, // cut from the batch and sent
         Delivered, // the transported says: delivered
         Accepted, // the builder says: received
-        Installed // built into the building
+        Installed, // built into the building
+        Disputed, // the builder objected to the delivery, waiting for the judge
+        Returned // the judge sent the piece back, it stays with the manufacturer
     }
 
     struct RawMaterial {
@@ -42,11 +44,13 @@ contract BatchLedger is OrchestratorGuard {
         uint32 batchId;
         uint32 buildingId;
         PieceState state;
+        uint48 deliveredAt;
     }
 
     uint32 public lastRawMaterialId;
     uint32 public lastBatchId;
     uint8 public immutable requiredVotes;
+    uint48 public immutable acceptanceWindow;
 
     mapping(uint32 => RawMaterial) public rawMaterials;
     mapping(uint32 => Batch) public batches;
@@ -105,6 +109,24 @@ contract BatchLedger is OrchestratorGuard {
         bytes32 evidenceHash
     );
 
+    event PieceDisputed(
+        uint256 indexed pieceId,
+        address indexed actor,
+        bytes32 reasonHash
+    );
+
+    event PieceDisputeResolved(
+        uint256 indexed pieceId,
+        address indexed actor,
+        bool accepted,
+        bytes32 reasonHash
+    );
+
+    event PieceAcceptedByTimeout(
+        uint256 indexed pieceId,
+        address indexed actor
+    );
+
     event PieceInstalled(
         uint256 indexed pieceId,
         uint32 indexed batchId,
@@ -126,10 +148,16 @@ contract BatchLedger is OrchestratorGuard {
     error AlreadyVoted(uint32 batchId, address certifier);
     error InvalidQuorum(uint8 requiredVotes);
     error TokenAlreadyAttached(uint32 batchId);
+    error InvalidWindow();
+    error DisputeWindowClosed(uint256 pieceId, uint48 deadline);
+    error AcceptanceWindowOpen(uint256 pieceId, uint48 deadline);
 
-    constructor(address actorRegistry, uint8 requiredVotes_) OrchestratorGuard(actorRegistry) {
+    constructor(address actorRegistry, uint8 requiredVotes_, uint48 acceptanceWindow_) OrchestratorGuard(actorRegistry) {
         if (requiredVotes_ == 0) revert InvalidQuorum(requiredVotes_);
+        if (acceptanceWindow_ == 0) revert InvalidWindow();
+
         requiredVotes = requiredVotes_;
+        acceptanceWindow = acceptanceWindow_;
     }
 
     function recordRawMaterial(address miner, bytes32 documentHash) 
@@ -245,12 +273,13 @@ contract BatchLedger is OrchestratorGuard {
         if (block.timestamp > batch.validUntil) revert CertificateExpired(batchId, batch.validUntil);
         
         if (pieces[pieceId].state != PieceState.None) revert PieceAlreadyExists(pieceId);
-        pieces[pieceId] = Piece(transporter, batchId, buildingId, PieceState.InTransit);
+        pieces[pieceId] = Piece(transporter, batchId, buildingId, PieceState.InTransit, 0);
         emit PieceDispatched(pieceId, batchId, buildingId, transporter, amount, actor);
     }
 
     function markDelivered(uint256 pieceId, address actor, bytes32 evidenceHash) external onlyOrchestrator {
-        _movePiece(pieceId, PieceState.InTransit, PieceState.Delivered);
+        Piece storage piece = _movePiece(pieceId, PieceState.InTransit, PieceState.Delivered);
+        piece.deliveredAt = uint48(block.timestamp);
 
         emit PieceDelivered(pieceId, actor, evidenceHash);
     }
@@ -259,6 +288,32 @@ contract BatchLedger is OrchestratorGuard {
         _movePiece(pieceId, PieceState.Delivered, PieceState.Accepted);
 
         emit PieceAccepted(pieceId, actor, evidenceHash);
+    }
+
+    function markDisputed(uint256 pieceId, address actor, bytes32 reasonHash) external onlyOrchestrator {
+        Piece storage piece = _movePiece(pieceId, PieceState.Delivered, PieceState.Disputed);
+
+        uint48 deadline = piece.deliveredAt + acceptanceWindow;
+        if (block.timestamp > deadline) revert DisputeWindowClosed(pieceId, deadline);
+
+        emit PieceDisputed(pieceId, actor, reasonHash);
+    }
+
+    function resolveDispute(uint256 pieceId, address actor, bool accept, bytes32 reasonHash)
+        external onlyOrchestrator 
+    {
+        _movePiece(pieceId, PieceState.Disputed, accept ? PieceState.Accepted : PieceState.Returned);
+
+        emit PieceDisputeResolved(pieceId, actor, accept, reasonHash);
+    }
+
+    function markAcceptedByTimeout(uint256 pieceId, address actor) external onlyOrchestrator {
+        Piece storage piece = _movePiece(pieceId, PieceState.Delivered, PieceState.Accepted);
+
+        uint48 deadline = piece.deliveredAt + acceptanceWindow;
+        if (block.timestamp <= deadline) revert AcceptanceWindowOpen(pieceId, deadline);
+
+        emit PieceAcceptedByTimeout(pieceId, actor);
     }
 
     function markInstalled(uint256 pieceId, address actor, bytes32 evidenceHash) external onlyOrchestrator {

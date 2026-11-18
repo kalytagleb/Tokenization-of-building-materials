@@ -11,11 +11,12 @@ const ORCHESTRATOR_ROLE = ethers.id("ORCHESTRATOR_ROLE");
 // The enums of the contract are stored as small numbers. We give them names
 // here so the tests are easy to read.
 const BatchState = { None: 0n, Proposed: 1n, Certified: 2n, Rejected: 3n, Revoked: 4n };
-const PieceState = { None: 0n, InTransit: 1n, Delivered: 2n, Accepted: 3n, Installed: 4n };
+const PieceState = { None: 0n, InTransit: 1n, Delivered: 2n, Accepted: 3n, Installed: 4n, Disputed: 5n, Returned: 6n };
 
 // A fake "document hash". In the real system this is the hash of a file in IPFS.
 const HASH = ethers.id("some document");
 const REQUIRED_VOTES = 2;
+const WINDOW = 500;
 
 describe("BatchLedger", function () {
   let admin: any;
@@ -45,7 +46,7 @@ describe("BatchLedger", function () {
     registry = await ethers.deployContract("ActorRegistry", [admin.address]);
     await registry.grantRole(ORCHESTRATOR_ROLE, orchestrator.address);
 
-    ledger = await ethers.deployContract("BatchLedger", [await registry.getAddress(), REQUIRED_VOTES]);
+    ledger = await ethers.deployContract("BatchLedger", [await registry.getAddress(), REQUIRED_VOTES, WINDOW]);
   });
 
   // ---- Helpers: each one builds a situation we need in many tests ----------
@@ -91,6 +92,12 @@ describe("BatchLedger", function () {
     await ledger
       .connect(orchestrator)
       .createPiece(PIECE, batchId, transporter.address, BUILDING, 40n, manufacturer.address);
+    return batchId;
+  }
+
+  async function deliveredPiece() {
+    const batchId = await sentPiece();
+    await ledger.connect(orchestrator).markDelivered(PIECE, transporter.address, HASH);
     return batchId;
   }
 
@@ -350,12 +357,12 @@ describe("BatchLedger", function () {
       expect(await ledger.requiredVotes()).to.equal(REQUIRED_VOTES);
 
       await expect(
-        ethers.deployContract("BatchLedger", [await registry.getAddress(), 0]),
+        ethers.deployContract("BatchLedger", [await registry.getAddress(), 0, WINDOW]),
       ).to.be.revertedWithCustomError(ledger, "InvalidQuorum");
     });
 
     it("with a quorum of 1 one certifier is enough", async function () {
-      const single = await ethers.deployContract("BatchLedger", [await registry.getAddress(), 1]);
+      const single = await ethers.deployContract("BatchLedger", [await registry.getAddress(), 1, WINDOW]);
       await single.connect(orchestrator).recordRawMaterial(miner.address, HASH);
       await single.connect(orchestrator).createBatch(manufacturer.address, 1, CLAIMED, HASH);
 
@@ -547,6 +554,161 @@ describe("BatchLedger", function () {
     });
   });
 
+  describe("dispute and silence", function () {
+    it("remembers when the delivery was confirmed", async function () {
+      await sentPiece();
+      expect((await ledger.pieces(PIECE)).deliveredAt).to.equal(0n);
+
+      await ledger.connect(orchestrator).markDelivered(PIECE, transporter.address, HASH);
+      expect((await ledger.pieces(PIECE)).deliveredAt).to.equal(await now());
+    });
+
+    it("the window is set at deployment and can not be zero", async function () {
+      expect(await ledger.acceptanceWindow()).to.equal(WINDOW);
+
+      await expect(
+        ethers.deployContract("BatchLedger", [await registry.getAddress(), 2, 0]),
+      ).to.be.revertedWithCustomError(ledger, "InvalidWindow");
+    });
+
+    it("the builder can object inside the window: the piece is Disputed", async function () {
+      await deliveredPiece();
+
+      await expect(ledger.connect(orchestrator).markDisputed(PIECE, builder.address, HASH))
+        .to.emit(ledger, "PieceDisputed")
+        .withArgs(PIECE, builder.address, HASH);
+
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Disputed);
+    });
+
+    it("can not object after the window is closed", async function () {
+      await deliveredPiece();
+      await passTime(WINDOW + 100);
+
+      await expect(
+        ledger.connect(orchestrator).markDisputed(PIECE, builder.address, HASH),
+      ).to.be.revertedWithCustomError(ledger, "DisputeWindowClosed");
+    });
+
+    it("can object only to a delivered piece", async function () {
+      await sentPiece(); // still InTransit
+      await expect(
+        ledger.connect(orchestrator).markDisputed(PIECE, builder.address, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+
+      await ledger.connect(orchestrator).markDelivered(PIECE, transporter.address, HASH);
+      await ledger.connect(orchestrator).markAccepted(PIECE, builder.address, HASH);
+      await expect(
+        ledger.connect(orchestrator).markDisputed(PIECE, builder.address, HASH), // already Accepted
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+    });
+
+    it("a disputed piece is frozen until the judge decides", async function () {
+      await deliveredPiece();
+      await ledger.connect(orchestrator).markDisputed(PIECE, builder.address, HASH);
+
+      await expect(
+        ledger.connect(orchestrator).markAccepted(PIECE, builder.address, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+      await expect(
+        ledger.connect(orchestrator).markInstalled(PIECE, builder.address, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+
+      // silence does not work either: the piece is not Delivered any more
+      await passTime(WINDOW + 100);
+      await expect(
+        ledger.connect(orchestrator).markAcceptedByTimeout(PIECE, manufacturer.address),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+    });
+
+    it("the judge can accept the piece, and then it can be installed", async function () {
+      await deliveredPiece();
+      await ledger.connect(orchestrator).markDisputed(PIECE, builder.address, HASH);
+
+      await expect(ledger.connect(orchestrator).resolveDispute(PIECE, admin.address, true, HASH))
+        .to.emit(ledger, "PieceDisputeResolved")
+        .withArgs(PIECE, admin.address, true, HASH);
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Accepted);
+
+      await ledger.connect(orchestrator).markInstalled(PIECE, builder.address, HASH);
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Installed);
+    });
+
+    it("the judge can return the piece, and Returned is final", async function () {
+      await deliveredPiece();
+      await ledger.connect(orchestrator).markDisputed(PIECE, builder.address, HASH);
+
+      await expect(ledger.connect(orchestrator).resolveDispute(PIECE, admin.address, false, HASH))
+        .to.emit(ledger, "PieceDisputeResolved")
+        .withArgs(PIECE, admin.address, false, HASH);
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Returned);
+
+      await expect(
+        ledger.connect(orchestrator).markAccepted(PIECE, builder.address, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+      await expect(
+        ledger.connect(orchestrator).markInstalled(PIECE, builder.address, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+    });
+
+    it("the judge can decide only a piece that is Disputed", async function () {
+      await deliveredPiece();
+      await expect(
+        ledger.connect(orchestrator).resolveDispute(PIECE, admin.address, true, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+    });
+
+    it("silence: inside the window the piece can not be accepted by timeout", async function () {
+      await deliveredPiece();
+
+      await expect(
+        ledger.connect(orchestrator).markAcceptedByTimeout(PIECE, manufacturer.address),
+      ).to.be.revertedWithCustomError(ledger, "AcceptanceWindowOpen");
+    });
+
+    it("silence: after the window the piece counts as accepted", async function () {
+      await deliveredPiece();
+      await passTime(WINDOW + 100);
+
+      await expect(ledger.connect(orchestrator).markAcceptedByTimeout(PIECE, manufacturer.address))
+        .to.emit(ledger, "PieceAcceptedByTimeout")
+        .withArgs(PIECE, manufacturer.address);
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Accepted);
+
+      // and the right to object is gone
+      await expect(
+        ledger.connect(orchestrator).markDisputed(PIECE, builder.address, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+    });
+
+    it("the builder can still accept himself after the window (nobody did it before)", async function () {
+      await deliveredPiece();
+      await passTime(WINDOW + 100);
+
+      await ledger.connect(orchestrator).markAccepted(PIECE, builder.address, HASH);
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Accepted);
+    });
+
+    it("a piece that was never sent can not be disputed or accepted by silence", async function () {
+      await expect(
+        ledger.connect(orchestrator).markDisputed(555n, builder.address, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+      await expect(
+        ledger.connect(orchestrator).markAcceptedByTimeout(555n, builder.address),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+    });
+
+    it("a revoked batch freezes a disputed piece too", async function () {
+      const batchId = await deliveredPiece();
+      await ledger.connect(orchestrator).markDisputed(PIECE, builder.address, HASH);
+      await ledger.connect(orchestrator).revokeBatch(batchId, certifier.address, HASH);
+
+      await expect(
+        ledger.connect(orchestrator).resolveDispute(PIECE, admin.address, true, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongBatchState");
+    });
+  });
+
   // ---------------------------------------------------------------------------
   // Every function that changes something must refuse everybody except the
   // orchestrator. One loop checks all of them, so a function that is added
@@ -573,6 +735,9 @@ describe("BatchLedger", function () {
         ["markDelivered", () => ledger.connect(stranger).markDelivered(PIECE, stranger.address, HASH)],
         ["markAccepted", () => ledger.connect(stranger).markAccepted(PIECE, stranger.address, HASH)],
         ["markInstalled", () => ledger.connect(stranger).markInstalled(PIECE, stranger.address, HASH)],
+        ["markDisputed", () => ledger.connect(stranger).markDisputed(PIECE, stranger.address, HASH)],
+        ["resolveDispute", () => ledger.connect(stranger).resolveDispute(PIECE, stranger.address, true, HASH)],
+        ["markAcceptedByTimeout", () => ledger.connect(stranger).markAcceptedByTimeout(PIECE, stranger.address)],
       ];
 
       for (const [name, call] of calls) {

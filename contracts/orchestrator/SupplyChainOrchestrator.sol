@@ -26,6 +26,7 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
     error NotTokenOwner(uint256 tokenId, address caller);
     error TransporterWithoutRole(address transporter);
     error VerifierIsManufacturer(address account);
+    error NotPartyOfPiece(uint256 pieceId, address caller);
 
     IAccessControl public immutable actors;
     MaterialBatchToken public immutable token;
@@ -128,7 +129,7 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
     function confirmDelivery(uint256 pieceId, bytes32 evidenceHash)
         external safe nonReentrant onlyRole(Roles.TRANSPORTER_ROLE)
     {
-        (address transporter,,,) = ledger.pieces(pieceId);
+        (address transporter,,,,) = ledger.pieces(pieceId);
 
         if (transporter != msg.sender) revert NotAssignedTransporter(pieceId, msg.sender);
         ledger.markDelivered(pieceId, msg.sender, evidenceHash);
@@ -137,7 +138,7 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
     function acceptDelivery(uint256 pieceId, bytes32 evidenceHash)
         external safe nonReentrant onlyRole(Roles.BUILDER_ROLE)
     {
-        (, , uint32 buildingId, ) = ledger.pieces(pieceId);
+        (,, uint32 buildingId,, ) = ledger.pieces(pieceId);
         if (buildings.ownerOf(buildingId) != msg.sender) revert NotBuildingOwner(buildingId, msg.sender);
 
         ledger.markAccepted(pieceId, msg.sender, evidenceHash);
@@ -151,6 +152,36 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
 
         ledger.markInstalled(pieceId, msg.sender, evidenceHash);
         token.lockToken(pieceId);
+    }
+
+    function disputeDelivery(uint256 pieceId, bytes32 reasonHash)
+        external safe nonReentrant onlyRole(Roles.BUILDER_ROLE)
+    {
+        (,, uint32 buildingId,,) = ledger.pieces(pieceId);
+        if (buildings.ownerOf(buildingId) != msg.sender) revert NotBuildingOwner(buildingId, msg.sender);
+
+        ledger.markDisputed(pieceId, msg.sender, reasonHash);
+    }
+
+    function resolveDispute(uint256 pieceId, bool accept, bytes32 reasonHash)
+        external safe nonReentrant
+    {
+        _requireAdmin();
+
+        (,, uint32 buildingId,,) = ledger.pieces(pieceId);
+        ledger.resolveDispute(pieceId, msg.sender, accept, reasonHash);
+
+        if (accept) _moveToBuilder(pieceId, buildingId);
+    }
+
+    function acceptByTimeout(uint256 pieceId) external safe nonReentrant {
+        (address transporter, uint32 batchId, uint32 buildingId,,) = ledger.pieces(pieceId);
+        (address manufacturer,,,,,,,) = ledger.batches(batchId);
+
+        if (msg.sender != transporter && msg.sender != manufacturer) revert NotPartyOfPiece(pieceId, msg.sender);
+
+        ledger.markAcceptedByTimeout(pieceId, msg.sender);
+        _moveToBuilder(pieceId, buildingId); 
     }
 
     function defineIndicator(string calldata name, bytes32 unit) 
@@ -183,5 +214,9 @@ contract SupplyChainOrchestrator is Pausable, ReentrancyGuard {
         if (!allowed) revert MissingRole(Roles.EPD_VERIFIER_ROLE, msg.sender);
 
         environment.revokeMeasurement(batchId, indicatorId, msg.sender, reasonHash);
+    }
+
+    function _moveToBuilder(uint256 pieceId, uint32 buildingId) internal {
+        token.moveToken(token.ownerOf(pieceId), buildings.ownerOf(buildingId), pieceId);
     }
 }

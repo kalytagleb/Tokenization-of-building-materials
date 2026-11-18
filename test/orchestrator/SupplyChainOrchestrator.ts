@@ -13,7 +13,8 @@ const HASH = ethers.id("document");
 // The enums of the contracts are stored as small numbers.
 // We give them names so the tests are easy to read.
 const BatchState = { Certified: 2n, Revoked: 4n };
-const PieceState = { InTransit: 1n, Delivered: 2n, Accepted: 3n, Installed: 4n };
+const PieceState = { InTransit: 1n, Delivered: 2n, Accepted: 3n, Installed: 4n, Disputed: 5n, Returned: 6n };
+const WINDOW = 1000;
 
 describe("SupplyChainOrchestrator", function () {
   // The people of the supply chain. Each one is just an account of the test network.
@@ -31,7 +32,7 @@ describe("SupplyChainOrchestrator", function () {
     registry = await ethers.deployContract("ActorRegistry", [admin.address]);
     const r = await registry.getAddress();
     token = await ethers.deployContract("MaterialBatchToken", [r]);
-    ledger = await ethers.deployContract("BatchLedger", [r, 2]); // 2 equal votes decide
+    ledger = await ethers.deployContract("BatchLedger", [r, 2, WINDOW]); // 2 equal votes decide
     buildings = await ethers.deployContract("BuildingRegistry", [r]);
     environment = await ethers.deployContract("EnvironmentalRegistry", [r]);
     orch = await ethers.deployContract("SupplyChainOrchestrator", [
@@ -55,6 +56,12 @@ describe("SupplyChainOrchestrator", function () {
   // The current time of the test blockchain.
   async function now(): Promise<number> {
     return (await ethers.provider.getBlock("latest"))!.timestamp;
+  }
+
+  // Moves the clock of the test blockchain forward.
+  async function passTime(seconds: number) {
+    await ethers.provider.send("evm_increaseTime", [seconds]);
+    await ethers.provider.send("evm_mine", []);
   }
 
   // ---- Helpers: each one builds the situation up to some step ---------------
@@ -306,6 +313,153 @@ describe("SupplyChainOrchestrator", function () {
       await expect(
         orch.connect(builder).acceptDelivery(PIECE, HASH), // not delivered yet
       ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+    });
+  });
+
+  describe("dispute and silence", function () {
+    it("the builder objects, the piece is frozen and the token does not move", async function () {
+      await delivered();
+
+      await expect(orch.connect(builder).disputeDelivery(PIECE, HASH))
+        .to.emit(ledger, "PieceDisputed")
+        .withArgs(PIECE, builder.address, HASH);
+
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Disputed);
+      expect(await token.ownerOf(PIECE)).to.equal(manufacturer.address);
+
+      await expect(
+        orch.connect(builder).acceptDelivery(PIECE, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+    });
+
+    it("only the owner of the building can object", async function () {
+      await delivered();
+      await registry.grantRole(role("BUILDER_ROLE"), stranger.address);
+
+      await expect(
+        orch.connect(stranger).disputeDelivery(PIECE, HASH),
+      ).to.be.revertedWithCustomError(orch, "NotBuildingOwner");
+      await expect(
+        orch.connect(manufacturer).disputeDelivery(PIECE, HASH),
+      ).to.be.revertedWithCustomError(orch, "MissingRole");
+    });
+
+    it("can not object after the window", async function () {
+      await delivered();
+      await passTime(WINDOW + 100);
+
+      await expect(
+        orch.connect(builder).disputeDelivery(PIECE, HASH),
+      ).to.be.revertedWithCustomError(ledger, "DisputeWindowClosed");
+    });
+
+    it("the judge accepts: the token goes to the builder who can install it", async function () {
+      await delivered();
+      await orch.connect(builder).disputeDelivery(PIECE, HASH);
+
+      await orch.connect(admin).resolveDispute(PIECE, true, HASH);
+
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Accepted);
+      expect(await token.ownerOf(PIECE)).to.equal(builder.address);
+
+      await orch.connect(builder).installPiece(PIECE, HASH);
+      expect(await token.locked(PIECE)).to.equal(true);
+    });
+
+    it("the judge returns: the token stays with the manufacturer and can not be installed", async function () {
+      await delivered();
+      await orch.connect(builder).disputeDelivery(PIECE, HASH);
+
+      await orch.connect(admin).resolveDispute(PIECE, false, HASH);
+
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Returned);
+      expect(await token.ownerOf(PIECE)).to.equal(manufacturer.address);
+      await expect(
+        orch.connect(builder).installPiece(PIECE, HASH),
+      ).to.be.revertedWithCustomError(orch, "NotTokenOwner");
+    });
+
+    it("only the admin is the judge", async function () {
+      await delivered();
+      await orch.connect(builder).disputeDelivery(PIECE, HASH);
+
+      await expect(
+        orch.connect(builder).resolveDispute(PIECE, true, HASH),
+      ).to.be.revertedWithCustomError(orch, "NotAdmin");
+      await expect(
+        orch.connect(manufacturer).resolveDispute(PIECE, false, HASH),
+      ).to.be.revertedWithCustomError(orch, "NotAdmin");
+    });
+
+    it("silence: not before the end of the window", async function () {
+      await delivered();
+
+      await expect(
+        orch.connect(manufacturer).acceptByTimeout(PIECE),
+      ).to.be.revertedWithCustomError(ledger, "AcceptanceWindowOpen");
+    });
+
+    it("silence: after the window the manufacturer can close it, the token goes to the builder", async function () {
+      await delivered();
+      await passTime(WINDOW + 100);
+
+      await orch.connect(manufacturer).acceptByTimeout(PIECE);
+
+      expect((await ledger.pieces(PIECE)).state).to.equal(PieceState.Accepted);
+      expect(await token.ownerOf(PIECE)).to.equal(builder.address);
+
+      await orch.connect(builder).installPiece(PIECE, HASH);
+      expect(await token.locked(PIECE)).to.equal(true);
+    });
+
+    it("silence: the assigned transporter can close it too", async function () {
+      await delivered();
+      await passTime(WINDOW + 100);
+
+      await orch.connect(transporter).acceptByTimeout(PIECE);
+      expect(await token.ownerOf(PIECE)).to.equal(builder.address);
+    });
+
+    it("silence: a stranger and the builder can not use it", async function () {
+      await delivered();
+      await passTime(WINDOW + 100);
+
+      await expect(
+        orch.connect(stranger).acceptByTimeout(PIECE),
+      ).to.be.revertedWithCustomError(orch, "NotPartyOfPiece");
+      await expect(
+        orch.connect(builder).acceptByTimeout(PIECE),
+      ).to.be.revertedWithCustomError(orch, "NotPartyOfPiece");
+    });
+
+    it("silence: another transporter or another manufacturer is not a party of this piece", async function () {
+      await delivered();
+      await passTime(WINDOW + 100);
+      await registry.grantRole(role("TRANSPORTER_ROLE"), stranger.address);
+      await registry.grantRole(role("MANUFACTURER_ROLE"), stranger.address);
+
+      await expect(
+        orch.connect(stranger).acceptByTimeout(PIECE),
+      ).to.be.revertedWithCustomError(orch, "NotPartyOfPiece");
+    });
+
+    it("silence: after it the builder can not object any more", async function () {
+      await delivered();
+      await passTime(WINDOW + 100);
+      await orch.connect(manufacturer).acceptByTimeout(PIECE);
+
+      await expect(
+        orch.connect(builder).disputeDelivery(PIECE, HASH),
+      ).to.be.revertedWithCustomError(ledger, "WrongPieceState");
+    });
+
+    it("everything stops on pause", async function () {
+      await delivered();
+      await orch.connect(admin).pause();
+
+      await expect(orch.connect(builder).disputeDelivery(PIECE, HASH)).to.be.revertedWith("Pausable: paused");
+      await expect(orch.connect(admin).resolveDispute(PIECE, true, HASH)).to.be.revertedWith("Pausable: paused");
+      await expect(orch.connect(manufacturer).acceptByTimeout(PIECE)).to.be.revertedWith("Pausable: paused");
     });
   });
 
